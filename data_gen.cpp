@@ -1,19 +1,3 @@
-#if DATA_GEN
-#include <cerrno>
-#include <cstdint>
-#include <cstdio>
-#include <filesystem>
-#include <limits>
-#include <memory>
-#include <string>
-#include <vector>
-#endif
-
-
-
-
-
-
 
 #if DATA_GEN
 namespace
@@ -68,10 +52,59 @@ static bool dataGenAppendMetadata(const fs::path &filePath, const CodingUnit &cu
   }
 
   const int result = std::fprintf(fp, "%d %d %d %d %d %d %d %d %d %d\n", cu.slice->m_poc, cu.lx(), cu.ly(),
-                                  cu.lwidth(), cu.lheight(), cu.interDir, static_cast<int>(refList), cu.refIdx[refList],
+                                  cu.lheight(), cu.lwidth(), cu.interDir, static_cast<int>(refList), cu.refIdx[refList],
                                   cu.mv[refList].getHor(), cu.mv[refList].getVer());
   std::fclose(fp);
   return result > 0;
+}
+
+static bool dataGenBuildReferencePatch(InterPrediction &interPred, const CodingUnit &cu, std::vector<uint16_t> &patch)
+{
+  const RefPicList refList = cu.interDir == 1 ? RPL0 : RPL1;
+  const int        patchW  = cu.lwidth() + 2;
+  const int        patchH  = cu.lheight() + 2;
+
+  if (cu.refIdx[refList] < 0)
+  {
+    return false;
+  }
+
+  const Picture *refPic = cu.slice->getRefPic(refList, cu.refIdx[refList]);
+  if (refPic == nullptr || refPic->isRefScaled(cu.cs->pps) || refPic->isWrapAroundEnabled(cu.cs->pps))
+  {
+    return false;
+  }
+
+  CodingUnit patchCu(cu.chromaFormat, Area(cu.lx() - 2, cu.ly() - 2, patchW, patchH));
+  patchCu = static_cast<const InterPredictionData &>(cu);
+  patchCu.cs        = cu.cs;
+  patchCu.slice     = cu.slice;
+  patchCu.chType    = ChannelType::LUMA;
+  patchCu.predMode  = cu.predMode;
+  patchCu.skip      = cu.skip;
+  patchCu.mmvdSkip  = cu.mmvdSkip;
+  patchCu.mergeType = MergeType::DEFAULT_N;
+  patchCu.obmcFlag  = false;
+  patchCu.licFlag   = false;
+  patchCu.ciipFlag  = false;
+  patchCu.geoFlag   = false;
+  patchCu.affine    = false;
+
+  std::vector<Pel> referencePatchPel(size_t(patchW) * size_t(patchH), 0);
+  PelBuf           referencePatchY(referencePatchPel.data(), patchW, patchW, patchH);
+  PelUnitBuf       referencePatchBuf(cu.chromaFormat, referencePatchY);
+  interPred.motionCompensation(patchCu, referencePatchBuf, refList, true, false, nullptr, false);
+
+  patch.resize(referencePatchPel.size());
+  for (size_t idx = 0; idx < referencePatchPel.size(); idx++)
+  {
+    if (!dataGenPelToU16(referencePatchPel[idx], patch[idx]))
+    {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 static bool dataGenBuildPredictorPatch(const CodingUnit &cu, std::vector<uint16_t> &patch)
@@ -141,82 +174,43 @@ static bool dataGenBuildPredictorPatch(const CodingUnit &cu, std::vector<uint16_
 
 
 
-
-
-
-
-#if DATA_GEN
-void DecCu::setFileName(std::string binFileName, std::string dataRoot)
-{
-  m_binFileName = binFileName;
-  m_dataRoot = dataRoot;
-}
-#endif
-
-
-
-
-
-
-
-
 #if DATA_GEN
   if (dataGenIsEligibleInterCu(cu))
   {
     const RefPicList refList = cu.interDir == 1 ? RPL0 : RPL1;
     std::vector<uint16_t> predictorPatch;
     std::vector<uint16_t> referencePatch;
-    const int             patchW = cu.lwidth() + 2;
-    const int             patchH = cu.lheight() + 2;
 
-    if (dataGenBuildPredictorPatch(cu, predictorPatch))
+    if (dataGenBuildPredictorPatch(cu, predictorPatch) && dataGenBuildReferencePatch(*m_pcInterPred, cu, referencePatch))
     {
-      std::vector<Pel> referencePatchPel(size_t(patchW) * size_t(patchH), 0);
-      PelBuf           referencePatchBuf(referencePatchPel.data(), patchW, patchW, patchH);
-      const Area       referenceArea(Position(cu.lx() - 2, cu.ly() - 2), Size(patchW, patchH));
+      const fs::path seqRoot =
+        fs::path(m_dataRoot) /
+        (fs::path(m_binFileName).stem().empty() ? "unknown_bitstream" : fs::path(m_binFileName).stem().string()) /
+        "inter_merge_uni_default";
+      const fs::path predictorDir = seqRoot / "predictor";
+      const fs::path referenceDir = seqRoot / "reference";
+      const fs::path metadataDir  = seqRoot / "metadata";
 
-      if (m_pcInterPred->dataGenGetLumaUniMcPatch(cu, referenceArea, referencePatchBuf))
+      // File format:
+      // - predictor/<h>x<w>.bin: appended samples, each sample is a (h+2) x (w+2) luma patch in row-major order.
+      // - reference/<h>x<w>.bin: appended samples aligned 1:1 with predictor, same uint16 little-endian layout.
+      // - metadata/<h>x<w>.txt: one line per sample:
+      //   poc x y h w interDir refList refIdx mvx mvy
+      if (fs::create_directories(predictorDir) || fs::exists(predictorDir))
       {
-        referencePatch.resize(referencePatchPel.size());
-        bool referenceOk = true;
-        for (size_t idx = 0; idx < referencePatchPel.size(); idx++)
+        if (fs::create_directories(referenceDir) || fs::exists(referenceDir))
         {
-          referenceOk &= dataGenPelToU16(referencePatchPel[idx], referencePatch[idx]);
-        }
-
-        if (referenceOk)
-        {
-          const fs::path seqRoot =
-            fs::path(m_dataRoot) / (fs::path(m_binFileName).stem().empty() ? "unknown_bitstream"
-                                                                          : fs::path(m_binFileName).stem().string()) /
-            "inter_merge_uni_default";
-          const fs::path predictorDir = seqRoot / "predictor";
-          const fs::path referenceDir = seqRoot / "reference";
-          const fs::path metadataDir  = seqRoot / "metadata";
-
-          // File format:
-          // - predictor/<w>x<h>.bin: appended samples, each sample is a (h+2) x (w+2) luma patch in row-major order.
-          // - reference/<w>x<h>.bin: appended samples aligned 1:1 with predictor, same uint16 little-endian layout.
-          // - metadata/<w>x<h>.txt: one line per sample:
-          //   poc x y w h interDir refList refIdx mvx mvy
-          if (fs::create_directories(predictorDir) || fs::exists(predictorDir))
+          if (fs::create_directories(metadataDir) || fs::exists(metadataDir))
           {
-            if (fs::create_directories(referenceDir) || fs::exists(referenceDir))
-            {
-              if (fs::create_directories(metadataDir) || fs::exists(metadataDir))
-              {
-                const std::string baseName =
-                  std::to_string(cu.lwidth()) + "x" + std::to_string(cu.lheight());
-                const fs::path predictorPath = predictorDir / (baseName + ".bin");
-                const fs::path referencePath = referenceDir / (baseName + ".bin");
-                const fs::path metadataPath  = metadataDir / (baseName + ".txt");
+            const std::string baseName = std::to_string(cu.lheight()) + "x" + std::to_string(cu.lwidth());
+            const fs::path predictorPath = predictorDir / (baseName + ".bin");
+            const fs::path referencePath = referenceDir / (baseName + ".bin");
+            const fs::path metadataPath  = metadataDir / (baseName + ".txt");
 
-                if (dataGenAppendBinaryU16(predictorPath, predictorPatch) &&
-                    dataGenAppendBinaryU16(referencePath, referencePatch))
-                {
-                  (void)dataGenAppendMetadata(metadataPath, cu, refList);
-                }
-              }
+            if (dataGenAppendBinaryU16(predictorPath, predictorPatch) &&
+                dataGenAppendBinaryU16(referencePath, referencePatch))
+            {
+              (void)dataGenAppendMetadata(metadataPath, cu, refList);
             }
           }
         }
@@ -224,85 +218,6 @@ void DecCu::setFileName(std::string binFileName, std::string dataRoot)
     }
   }
 #endif
-
-
-
-
-
-
-
-
-
-
-#if DATA_GEN
-  bool dataGenGetLumaUniMcPatch(const CodingUnit &cu, const Area &patchArea, PelBuf dstBuf);
-#endif
-
-
-
-
-
-#if DATA_GEN
-#include <memory>
-#endif
-
-
-
-
-
-
-#if DATA_GEN
-bool InterPrediction::dataGenGetLumaUniMcPatch(const CodingUnit &cu, const Area &patchArea, PelBuf dstBuf)
-{
-  if (patchArea.size() != Size(dstBuf.width, dstBuf.height) || (cu.interDir != 1 && cu.interDir != 2))
-  {
-    return false;
-  }
-
-  const RefPicList refList = cu.interDir == 1 ? RPL0 : RPL1;
-  const int        refIdx  = cu.refIdx[refList];
-  if (refIdx < 0)
-  {
-    return false;
-  }
-
-  const Picture *refPic = cu.slice->getRefPic(refList, refIdx);
-  if (refPic == nullptr || refPic->isRefScaled(cu.cs->pps) || refPic->isWrapAroundEnabled(cu.cs->pps))
-  {
-    return false;
-  }
-
-  std::unique_ptr<bool[]> mcMaskStore(new bool[patchArea.width * patchArea.height]());
-  if (isMvOOB(cu.mv[refList], patchArea.pos(), patchArea.size(), cu.slice->m_sps, cu.cs->pps, mcMaskStore.get(),
-              nullptr, true))
-  {
-    return false;
-  }
-
-  CodingUnit patchCu(cu.chromaFormat, patchArea);
-  patchCu = static_cast<const InterPredictionData &>(cu);
-  patchCu.cs        = cu.cs;
-  patchCu.slice     = cu.slice;
-  patchCu.chType    = ChannelType::LUMA;
-  patchCu.predMode  = cu.predMode;
-  patchCu.mergeType = MergeType::DEFAULT_N;
-  patchCu.obmcFlag  = false;
-  patchCu.licFlag   = false;
-  patchCu.ciipFlag  = false;
-  patchCu.geoFlag   = false;
-  patchCu.affine    = false;
-
-  PelUnitBuf dstUnit(cu.chromaFormat, dstBuf);
-  xPredInterBlk(COMP_Y, patchCu, refPic, patchCu.mv[refList], dstUnit, false, cu.slice->clpRng(COMP_Y), false, false,
-                refList);
-  return true;
-}
-#endif
-
-
-
-
-
 
 
 

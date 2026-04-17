@@ -234,6 +234,75 @@ void DecCu::setFileName(std::string binFileName, std::string dataRoot)
 
 
 
+#if DATA_GEN
+  bool dataGenGetLumaUniMcPatch(const CodingUnit &cu, const Area &patchArea, PelBuf dstBuf);
+#endif
+
+
+
+
+
+#if DATA_GEN
+#include <memory>
+#endif
+
+
+
+
+
+
+#if DATA_GEN
+bool InterPrediction::dataGenGetLumaUniMcPatch(const CodingUnit &cu, const Area &patchArea, PelBuf dstBuf)
+{
+  if (patchArea.size() != Size(dstBuf.width, dstBuf.height) || (cu.interDir != 1 && cu.interDir != 2))
+  {
+    return false;
+  }
+
+  const RefPicList refList = cu.interDir == 1 ? RPL0 : RPL1;
+  const int        refIdx  = cu.refIdx[refList];
+  if (refIdx < 0)
+  {
+    return false;
+  }
+
+  const Picture *refPic = cu.slice->getRefPic(refList, refIdx);
+  if (refPic == nullptr || refPic->isRefScaled(cu.cs->pps) || refPic->isWrapAroundEnabled(cu.cs->pps))
+  {
+    return false;
+  }
+
+  std::unique_ptr<bool[]> mcMaskStore(new bool[patchArea.width * patchArea.height]());
+  if (isMvOOB(cu.mv[refList], patchArea.pos(), patchArea.size(), cu.slice->m_sps, cu.cs->pps, mcMaskStore.get(),
+              nullptr, true))
+  {
+    return false;
+  }
+
+  CodingUnit patchCu(cu.chromaFormat, patchArea);
+  patchCu = static_cast<const InterPredictionData &>(cu);
+  patchCu.cs        = cu.cs;
+  patchCu.slice     = cu.slice;
+  patchCu.chType    = ChannelType::LUMA;
+  patchCu.predMode  = cu.predMode;
+  patchCu.mergeType = MergeType::DEFAULT_N;
+  patchCu.obmcFlag  = false;
+  patchCu.licFlag   = false;
+  patchCu.ciipFlag  = false;
+  patchCu.geoFlag   = false;
+  patchCu.affine    = false;
+
+  PelUnitBuf dstUnit(cu.chromaFormat, dstBuf);
+  xPredInterBlk(COMP_Y, patchCu, refPic, patchCu.mv[refList], dstUnit, false, cu.slice->clpRng(COMP_Y), false, false,
+                refList);
+  return true;
+}
+#endif
+
+
+
+
+
 
 
 

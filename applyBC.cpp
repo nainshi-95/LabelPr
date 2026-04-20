@@ -639,3 +639,74 @@ void BoundaryModel::forward(
 
 
 
+
+
+
+
+
+
+static SimpleNN::Tensor makePredExtTensor(
+    const CodingUnit& cu,
+    const CPelBuf& srcBuf)
+{
+  const CompArea& blk = cu.Y();
+
+  const int x = blk.x;
+  const int y = blk.y;
+  const int w = blk.width;
+  const int h = blk.height;
+
+  CHECK(srcBuf.width != w || srcBuf.height != h, "srcBuf size mismatch");
+
+  const CPelBuf recoBuf = cu.cs->picture->getRecoBuf(COMPONENT_Y);
+  const int picW = cu.cs->picture->Y().width;
+  const int picH = cu.cs->picture->Y().height;
+
+  // output: [1, h+4, w+4]
+  SimpleNN::Tensor predExt(1, h + 4, w + 4);
+
+  // 1) fill whole tensor with recon context
+  // local (yy, xx) corresponds to global (y - 4 + yy, x - 4 + xx)
+  for (int yy = 0; yy < h + 4; ++yy)
+  {
+    for (int xx = 0; xx < w + 4; ++xx)
+    {
+      const int globalY = y - 4 + yy;
+      const int globalX = x - 4 + xx;
+
+      float v = 0.0f;
+
+      if (globalX >= 0 && globalX < picW && globalY >= 0 && globalY < picH)
+      {
+        v = static_cast<float>(recoBuf.buf[globalY * recoBuf.stride + globalX]);
+      }
+
+      predExt.at(0, yy, xx) = v;
+    }
+  }
+
+  // 2) overwrite current CU region with predictor
+  // predExt[4:, 4:] = srcBuf
+  for (int yy = 0; yy < h; ++yy)
+  {
+    const Pel* srcRow = srcBuf.buf + yy * srcBuf.stride;
+    for (int xx = 0; xx < w; ++xx)
+    {
+      predExt.at(0, yy + 4, xx + 4) = static_cast<float>(srcRow[xx]);
+    }
+  }
+
+  return predExt;
+}
+
+
+
+
+
+
+
+
+
+
+
+

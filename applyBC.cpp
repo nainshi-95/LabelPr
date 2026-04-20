@@ -409,3 +409,233 @@ void applyBoundaryCompensate(
 }
 
 } // namespace BoundaryComp
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#include "BoundaryModel.h"
+
+#include <cmath>
+
+// -----------------------------------------------------------------------------
+// helpers
+// -----------------------------------------------------------------------------
+
+static SimpleNN::Tensor transposeHW(const SimpleNN::Tensor& in)
+{
+  SimpleNN::Tensor out(in.C, in.W, in.H);
+
+  for (int c = 0; c < in.C; ++c)
+  {
+    for (int y = 0; y < in.H; ++y)
+    {
+      for (int x = 0; x < in.W; ++x)
+      {
+        out.at(c, x, y) = in.at(c, y, x);
+      }
+    }
+  }
+  return out;
+}
+
+// x_left = cat([pred[:, :, 4:, 0:8], ref[:, :, 4:, 0:8]], dim=1)
+// pred/ref each: [1, h+4, w+4]
+// output: [2, h, 8]
+static SimpleNN::Tensor makeLeftBranchInput(
+    const SimpleNN::Tensor& predExt,
+    const SimpleNN::Tensor& refExt)
+{
+  CHECK(predExt.C != 1 || refExt.C != 1, "predExt/refExt must have C=1");
+  CHECK(predExt.H != refExt.H || predExt.W != refExt.W, "predExt/refExt size mismatch");
+  CHECK(predExt.H < 8 || predExt.W < 8, "predExt/refExt too small");
+
+  const int h = predExt.H - 4;
+  const int w = predExt.W - 4;
+
+  (void)w;
+
+  CHECK(h % 4 != 0, "Left branch length must be multiple of 4");
+
+  SimpleNN::Tensor out(2, h, 8);
+
+  for (int y = 0; y < h; ++y)
+  {
+    for (int x = 0; x < 8; ++x)
+    {
+      out.at(0, y, x) = predExt.at(0, y + 4, x);
+      out.at(1, y, x) = refExt.at(0, y + 4, x);
+    }
+  }
+
+  return out;
+}
+
+// x_top = cat([pred[:, :, 0:8, 4:], ref[:, :, 0:8, 4:]], dim=1)
+// before transpose: [2, 8, w]
+// after transpose : [2, w, 8]
+static SimpleNN::Tensor makeTopBranchInputTransposed(
+    const SimpleNN::Tensor& predExt,
+    const SimpleNN::Tensor& refExt)
+{
+  CHECK(predExt.C != 1 || refExt.C != 1, "predExt/refExt must have C=1");
+  CHECK(predExt.H != refExt.H || predExt.W != refExt.W, "predExt/refExt size mismatch");
+  CHECK(predExt.H < 8 || predExt.W < 8, "predExt/refExt too small");
+
+  const int h = predExt.H - 4;
+  const int w = predExt.W - 4;
+
+  (void)h;
+
+  CHECK(w % 4 != 0, "Top branch length must be multiple of 4");
+
+  SimpleNN::Tensor tmp(2, 8, w);
+
+  for (int y = 0; y < 8; ++y)
+  {
+    for (int x = 0; x < w; ++x)
+    {
+      tmp.at(0, y, x) = predExt.at(0, y, x + 4);
+      tmp.at(1, y, x) = refExt.at(0, y, x + 4);
+    }
+  }
+
+  return transposeHW(tmp); // [2, w, 8]
+}
+
+// pred[:, :, 4:, 4:8] += tanh(gate) * val
+static void applyLeftBranchOutput(
+    SimpleNN::Tensor& predExt,
+    const SimpleNN::Tensor& outLeft)
+{
+  CHECK(predExt.C != 1, "predExt must have C=1");
+  CHECK(outLeft.C != 2, "outLeft must have C=2");
+  CHECK(outLeft.H != predExt.H - 4 || outLeft.W != 4, "outLeft shape mismatch");
+
+  for (int y = 0; y < outLeft.H; ++y)
+  {
+    for (int x = 0; x < 4; ++x)
+    {
+      const float val  = outLeft.at(0, y, x);
+      const float gate = std::tanh(outLeft.at(1, y, x));
+      predExt.at(0, y + 4, x + 4) += gate * val;
+    }
+  }
+}
+
+// pred[:, :, 4:8, 4:] += tanh(gate) * val
+static void applyTopBranchOutput(
+    SimpleNN::Tensor& predExt,
+    const SimpleNN::Tensor& outTop)
+{
+  CHECK(predExt.C != 1, "predExt must have C=1");
+  CHECK(outTop.C != 2, "outTop must have C=2");
+  CHECK(outTop.H != 4 || outTop.W != predExt.W - 4, "outTop shape mismatch");
+
+  for (int y = 0; y < 4; ++y)
+  {
+    for (int x = 0; x < outTop.W; ++x)
+    {
+      const float val  = outTop.at(0, y, x);
+      const float gate = std::tanh(outTop.at(1, y, x));
+      predExt.at(0, y + 4, x + 4) += gate * val;
+    }
+  }
+}
+
+// return pred[:, :, 4:, 4:]
+static SimpleNN::Tensor cropCenterOutput(const SimpleNN::Tensor& predExt)
+{
+  CHECK(predExt.C != 1, "predExt must have C=1");
+  CHECK(predExt.H < 5 || predExt.W < 5, "predExt too small");
+
+  const int h = predExt.H - 4;
+  const int w = predExt.W - 4;
+
+  SimpleNN::Tensor out(1, h, w);
+
+  for (int y = 0; y < h; ++y)
+  {
+    for (int x = 0; x < w; ++x)
+    {
+      out.at(0, y, x) = predExt.at(0, y + 4, x + 4);
+    }
+  }
+
+  return out;
+}
+
+// -----------------------------------------------------------------------------
+// BoundaryModel
+// -----------------------------------------------------------------------------
+
+BoundaryModel::BoundaryModel(const BoundaryPredictionModel& predModel)
+  : m_predModel(predModel)
+{
+}
+
+void BoundaryModel::forward(
+    const SimpleNN::Tensor& predExt,
+    const SimpleNN::Tensor& refExt,
+    SimpleNN::Tensor& outTensor) const
+{
+  CHECK(predExt.C != 1 || refExt.C != 1, "predExt/refExt must have C=1");
+  CHECK(predExt.H != refExt.H || predExt.W != refExt.W, "predExt/refExt size mismatch");
+  CHECK(predExt.H < 8 || predExt.W < 8, "predExt/refExt too small");
+
+  const int h = predExt.H - 4;
+  const int w = predExt.W - 4;
+
+  CHECK(h % 4 != 0, "h must be multiple of 4");
+  CHECK(w % 4 != 0, "w must be multiple of 4");
+
+  // local mutable copy, because PyTorch forward updates pred in-place
+  SimpleNN::Tensor predWork = predExt;
+
+  // 1) left branch
+  {
+    SimpleNN::Tensor xLeft   = makeLeftBranchInput(predWork, refExt); // [2,h,8]
+    SimpleNN::Tensor outLeft;                                         // [2,h,4]
+    m_predModel.forward(xLeft, outLeft);
+    applyLeftBranchOutput(predWork, outLeft);
+  }
+
+  // 2) top branch
+  {
+    SimpleNN::Tensor xTopT   = makeTopBranchInputTransposed(predWork, refExt); // [2,w,8]
+    SimpleNN::Tensor outTopT;                                                  // [2,w,4]
+    m_predModel.forward(xTopT, outTopT);
+
+    SimpleNN::Tensor outTop = transposeHW(outTopT); // [2,4,w]
+    applyTopBranchOutput(predWork, outTop);
+  }
+
+  // 3) crop center
+  outTensor = cropCenterOutput(predWork); // [1,h,w]
+}
+
+
+
+
+
+
+
+
+
